@@ -4,7 +4,10 @@
 
 #include <csignal>
 #include <cerrno>
+#include <cstddef>
 #include <fcntl.h>
+#include <filesystem>
+#include <iterator>
 #include <sys/resource.h>
 #include <system_error>
 #include <type_traits>
@@ -93,6 +96,53 @@ TEST(Pipe, MovingTransfersBothEnds) {
     EXPECT_EQ(source.write_end().get(), -1);
     EXPECT_EQ(target.read_end().get(), reader);
     EXPECT_EQ(target.write_end().get(), writer);
+}
+
+TEST(Pipe, MoveAssignmentClosesPreviousDescriptorsAndTransfersNewEnds) {
+    auto destination = miniposix::Pipe::create();
+    const int old_reader = destination.read_end().get();
+    const int old_writer = destination.write_end().get();
+    ASSERT_GE(old_reader, 0);
+    ASSERT_GE(old_writer, 0);
+
+    auto source = miniposix::Pipe::create();
+    const int new_reader = source.read_end().get();
+    const int new_writer = source.write_end().get();
+    ASSERT_GE(new_reader, 0);
+    ASSERT_GE(new_writer, 0);
+
+    destination = std::move(source);
+
+    // Comparing get() alone would miss a leak: the wrapper values can look
+    // correct while the descriptors previously owned by destination stay open.
+    EXPECT_FALSE(is_open(old_reader));
+    EXPECT_FALSE(is_open(old_writer));
+    EXPECT_EQ(destination.read_end().get(), new_reader);
+    EXPECT_EQ(destination.write_end().get(), new_writer);
+    EXPECT_EQ(source.read_end().get(), -1);
+    EXPECT_EQ(source.write_end().get(), -1);
+
+    constexpr char sent = 'M';
+    ASSERT_EQ(::write(destination.write_end().get(), &sent, 1), 1);
+    char received = '\0';
+    ASSERT_EQ(::read(destination.read_end().get(), &received, 1), 1);
+    EXPECT_EQ(received, sent);
+
+    if(is_open(old_reader)) ::close(old_reader);
+    if(is_open(old_writer)) ::close(old_writer);
+}
+
+TEST(Pipe, RepeatedCreateDestroyDoesNotLeakDescriptors) {
+    const auto open_descriptors = [] {
+        return static_cast<std::size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                                                      std::filesystem::directory_iterator{}));
+    };
+
+    const auto before = open_descriptors();
+    for(int iteration = 0; iteration < 1000; ++iteration) {
+        auto pipe = miniposix::Pipe::create();
+    }
+    EXPECT_EQ(open_descriptors(), before);
 }
 
 TEST(Pipe, ReportsCreationFailureWithOperatingSystemError) {
